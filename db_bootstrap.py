@@ -21,6 +21,11 @@ from typing import Iterable, Sequence
 
 logger = logging.getLogger(__name__)
 
+try:  # normal plugin load: the ``hermes_lcm`` package
+    from . import clean_shutdown as _clean_shutdown
+except ImportError:  # pragma: no cover - loaded as a flat top-level module
+    import clean_shutdown as _clean_shutdown
+
 
 class SchemaVersionTooNewError(RuntimeError):
     """Raised when a database was written by a newer LCM schema than this build.
@@ -102,9 +107,11 @@ def configure_connection(conn: sqlite3.Connection) -> None:
     every process opens its own sqlite3.Connection pointing at the same
     lcm.db file.  These settings improve committed-write durability and WAL
     hygiene, but do NOT make sibling processes safe from an unexpected process
-    death.  Abnormal exit still depends on normal SQLite WAL recovery;
-    application-level checkpoints only run during graceful shutdown (see
-    ``MessageStore.close()`` etc.).
+    process death.  Abnormal exit still depends on normal SQLite WAL recovery;
+    application-level checkpoints run during graceful shutdown: every
+    connection configured here is registered with ``clean_shutdown``, which
+    checkpoints it with ``wal_checkpoint(TRUNCATE)`` and closes it on
+    ``atexit`` or ``SIGTERM`` (see ``clean_shutdown.py``).
 
     Key design decisions:
     - journal_mode=WAL  : writes go to a separate log; readers never block.
@@ -133,6 +140,11 @@ def configure_connection(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA wal_autocheckpoint=500")
     conn.execute("PRAGMA journal_size_limit=67108864")
     conn.execute("PRAGMA mmap_size=268435456")
+    # Give this connection a real shutdown path.  Without it an unclean stop
+    # leaves the WAL unmaterialised and the next open can report "database disk
+    # image is malformed"; clean_shutdown.py carries the measurements.
+    _clean_shutdown.register(conn)
+    _clean_shutdown.install()
 
 
 def _execute_wal_conversion_with_lock_retry(

@@ -683,12 +683,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return clone
 
     def _resolve_db_path(self, hermes_home: str = "") -> Path:
-        """Resolve the SQLite path for the active Hermes profile/home."""
+        """Resolve the SQLite path for the active Hermes profile/home.
+
+        Home-derived paths are resolved through symlinks before ``lcm.db`` is
+        appended.  A home reached via a symlinked alias (``/home/u/.hermes ->
+        /mnt/data/.hermes``) would otherwise hand the store a symlink as its
+        parent directory, which the private-storage hardening refuses
+        (``parent is not a regular directory``) -- so binding fails *after* the
+        previous store was already closed, leaving a dead connection behind.
+        Resolving here also makes every spelling of one home yield one path.
+        """
         if self._config.database_path:
             return Path(self._config.database_path)
         if hermes_home:
-            return Path(hermes_home) / "lcm.db"
-        return Path.home() / ".hermes" / "lcm.db"
+            return (Path(hermes_home) / "lcm.db").resolve()
+        return (Path.home() / ".hermes" / "lcm.db").resolve()
 
     def _bind_storage(self, db_path: str | Path, hermes_home: str = "") -> None:
         """Bind store/DAG/lifecycle helpers to one SQLite database."""
@@ -819,6 +828,34 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._clear_thread_context_stateless()
         self._reset_session_scoped_runtime_state()
 
+    @staticmethod
+    def _same_location(left: Any, right: Any) -> bool:
+        """True when two path spellings denote the same on-disk location.
+
+        A Hermes home can be reachable through more than one spelling: a
+        symlinked or bind-mounted root means ``/home/u/.hermes`` and
+        ``/mnt/data/.hermes`` can name the very same directory.  Comparing the
+        raw strings treats that alias as a profile switch and forces
+        ``_close_storage()`` followed by ``_bind_storage()``, which closes the
+        live SQLite connection.  Context compression runs on a background
+        worker thread, so that close can land while the worker is mid-query and
+        leave it calling ``.execute()`` on a connection that is already ``None``
+        (``AttributeError: 'NoneType' object has no attribute 'execute'``).
+
+        Resolve before comparing so an alias is never mistaken for a different
+        home.  Falls back to a literal comparison when resolution fails (the
+        path may not exist yet, which is normal for a not-yet-created home).
+        """
+        if not left or not right:
+            return False
+        left_str, right_str = str(left), str(right)
+        if left_str == right_str:
+            return True
+        try:
+            return Path(left_str).resolve() == Path(right_str).resolve()
+        except (OSError, RuntimeError):
+            return False
+
     def _rebind_storage_for_home(self, hermes_home: str = "") -> bool:
         """Switch SQLite-backed state when a reused engine serves another profile.
 
@@ -826,13 +863,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         Hermes versions may still reuse the same plugin/context-engine object
         after ``HERMES_HOME`` changes, so the plugin must not assume the store
         captured during ``register()`` is still correct.
+
+        Comparisons resolve paths first: two spellings of one directory are the
+        same home, and rebinding for them would needlessly close a live store.
         """
         if not hermes_home:
             return False
         if self._config.database_path:
             current_home = str(self._hermes_home or "")
             current_store_home = str(getattr(getattr(self, "_store", None), "_hermes_home", "") or "")
-            if current_home == str(hermes_home) and current_store_home == str(hermes_home):
+            if self._same_location(current_home, hermes_home) and self._same_location(current_store_home, hermes_home):
                 return False
             self._hermes_home = hermes_home
             store = getattr(self, "_store", None)
@@ -844,7 +884,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         db_path = self._resolve_db_path(hermes_home)
         current_db = Path(getattr(getattr(self, "_store", None), "db_path", ""))
-        if current_db == db_path and str(self._hermes_home or "") == str(hermes_home):
+        if self._same_location(current_db, db_path) and self._same_location(self._hermes_home, hermes_home):
             return False
 
         self._close_storage()
